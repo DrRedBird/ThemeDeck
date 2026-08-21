@@ -18,6 +18,12 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 4. On steam deck, go to decky settings, developer, 'install plugin from zip file', and find the zip from step 2. 
 
+## YouTube setup
+
+Use **Install YouTube support** (or **Update YouTube support**) inside ThemeDeck. ThemeDeck installs `yt-dlp` with its recommended dependencies and installs a private Deno runtime when a supported Deno executable is not already available.
+
+ThemeDeck uses Firefox cookies for YouTube previews and downloads. Sign in to YouTube in Firefox on the Steam Deck before using those actions. ThemeDeck passes this configuration directly to yt-dlp and does not replace your global yt-dlp configuration file.
+
 ![ThemeDeck June 29 2026 update thumbnail](https://images.steamusercontent.com/ugc/10246844756434218824/5BE3695A090A9AD263F22EE5F73C7CDA3B84CEB0/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
 ## Main Features

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html as html_lib
 import json
 import os
+import platform
 import re
 import shutil
 import ssl
@@ -17,6 +19,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,14 @@ YTDLP_RELEASE_URLS = (
     "https://yt-dlp.org/downloads/latest/yt-dlp",
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 )
+DENO_MINIMUM_VERSION = (2, 3, 0)
+DENO_RELEASE_BASE_URL = "https://github.com/denoland/deno/releases/latest/download"
+DENO_RELEASE_ASSETS = {
+    ("linux", "x86_64"): "deno-x86_64-unknown-linux-gnu.zip",
+    ("linux", "amd64"): "deno-x86_64-unknown-linux-gnu.zip",
+    ("linux", "aarch64"): "deno-aarch64-unknown-linux-gnu.zip",
+    ("linux", "arm64"): "deno-aarch64-unknown-linux-gnu.zip",
+}
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -51,6 +62,8 @@ class Plugin:
         self._yt_venv_bin = self._yt_venv_dir / "bin"
         self._yt_venv_python = self._yt_venv_bin / "python"
         self._yt_venv_yt_dlp = self._yt_venv_bin / "yt-dlp"
+        self._deno_dir = self._settings_dir / "deno"
+        self._deno_path = self._deno_dir / "bin" / "deno"
         self._downloads_dir = self._settings_dir / "downloads"
         self._preview_dir = self._settings_dir / "previews"
         self._debug_log_file = Path.home() / "ThemeDeck" / "themedeck-debug.log"
@@ -563,14 +576,27 @@ class Plugin:
     async def get_yt_dlp_status(self) -> dict[str, Any]:
         invocation = self._resolve_yt_dlp_invocation()
         installed = bool(invocation)
+        deno_path = self._resolve_deno_path()
+        deno_version = await self._get_deno_version(deno_path) if deno_path else None
+        deno_installed = bool(
+            deno_path and self._is_supported_deno_version(deno_version)
+        )
         status: dict[str, Any] = {
             "installed": installed,
             "path": invocation["path"] if invocation else "",
             "source": "none",
             "version": "",
+            "deno_installed": deno_installed,
+            "deno_path": str(deno_path) if deno_path else "",
+            "deno_version": deno_version or "",
+            "cookies_browser": "firefox",
+            "ready": installed and deno_installed,
         }
         if not invocation:
-            self._log_info("yt-dlp status: not installed")
+            self._log_info(
+                "yt-dlp status: not installed "
+                f"deno={deno_version or 'not installed'}"
+            )
             return status
         status["source"] = invocation["source"]
         version = await self._get_yt_dlp_version(invocation)
@@ -578,8 +604,23 @@ class Plugin:
             status["version"] = version
         self._log_info(
             f"yt-dlp status source={status.get('source')} "
-            f"path={status.get('path')} version={status.get('version') or 'unknown'}"
+            f"path={status.get('path')} version={status.get('version') or 'unknown'} "
+            f"deno={deno_version or 'not installed'} ready={status.get('ready')}"
         )
+        return status
+
+    async def _finish_youtube_support_setup(self) -> dict[str, Any]:
+        deno_error = await self._ensure_deno()
+        if deno_error:
+            raise RuntimeError(
+                f"yt-dlp installed, but Deno setup failed: {deno_error}"
+            )
+
+        status = await self.get_yt_dlp_status()
+        if not status.get("installed"):
+            raise RuntimeError("yt-dlp update completed but executable was not found")
+        if not status.get("deno_installed"):
+            raise RuntimeError("Deno setup completed but a supported executable was not found")
         return status
 
     async def update_yt_dlp(self) -> dict[str, Any]:
@@ -591,10 +632,13 @@ class Plugin:
         else:
             self._log_info("yt-dlp venv install/update completed")
         status = await self.get_yt_dlp_status()
-        if status.get("installed") and status.get("source") in {"venv", "system"}:
+        if not venv_error and status.get("source") == "venv":
+            status = await self._finish_youtube_support_setup()
             if status.get("version"):
                 self._log_info(
-                    f"yt-dlp available via {status.get('source')} ({status.get('version')})"
+                    "YouTube support available via "
+                    f"{status.get('source')} yt-dlp {status.get('version')} and "
+                    f"Deno {status.get('deno_version') or 'unknown'}"
                 )
             return status
 
@@ -626,7 +670,7 @@ class Plugin:
             status = await self.get_yt_dlp_status()
             if status.get("installed"):
                 self._log_info("yt-dlp became available via pip/system fallback")
-                return status
+                return await self._finish_youtube_support_setup()
             summary = self._trim_message(str(error), 140)
             if venv_error:
                 summary = self._trim_message(f"{summary}; venv: {venv_error}", 220)
@@ -639,12 +683,11 @@ class Plugin:
                     temp_path.unlink()
                 except OSError:
                     pass
-        status = await self.get_yt_dlp_status()
-        if not status.get("installed"):
-            raise RuntimeError("yt-dlp update completed but executable was not found")
+        status = await self._finish_youtube_support_setup()
         self._log_info(
             f"yt-dlp update finished source={status.get('source')} "
-            f"version={status.get('version') or 'unknown'}"
+            f"version={status.get('version') or 'unknown'} "
+            f"deno={status.get('deno_version') or 'unknown'}"
         )
         return status
 
@@ -720,6 +763,7 @@ class Plugin:
 
         command = [
             *yt_dlp["command"],
+            *self._youtube_access_args(),
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
@@ -774,6 +818,7 @@ class Plugin:
 
         command = [
             *yt_dlp["command"],
+            *self._youtube_access_args(),
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
@@ -1241,13 +1286,12 @@ class Plugin:
                 "path": str(self._yt_venv_yt_dlp),
             }
 
-        system_yt_dlp = shutil.which("yt-dlp")
-        if system_yt_dlp:
+        if self._yt_dlp_path.exists() and os.access(self._yt_dlp_path, os.X_OK):
             return {
-                "command": [system_yt_dlp],
+                "command": [str(self._yt_dlp_path)],
                 "env": None,
-                "source": "system",
-                "path": system_yt_dlp,
+                "source": "local",
+                "path": str(self._yt_dlp_path),
             }
 
         user_yt_dlp = Path.home() / ".local" / "bin" / "yt-dlp"
@@ -1259,15 +1303,45 @@ class Plugin:
                 "path": str(user_yt_dlp),
             }
 
-        if self._yt_dlp_path.exists() and os.access(self._yt_dlp_path, os.X_OK):
+        system_yt_dlp = shutil.which("yt-dlp")
+        if system_yt_dlp:
             return {
-                "command": [str(self._yt_dlp_path)],
+                "command": [system_yt_dlp],
                 "env": None,
-                "source": "local",
-                "path": str(self._yt_dlp_path),
+                "source": "system",
+                "path": system_yt_dlp,
             }
 
         return None
+
+    def _resolve_deno_path(self) -> Path | None:
+        candidates: list[Path] = [self._deno_path]
+        system_deno = shutil.which("deno")
+        if system_deno:
+            candidates.append(Path(system_deno))
+        candidates.extend(
+            [
+                Path.home() / ".deno" / "bin" / "deno",
+                Path("/home/deck/.deno/bin/deno"),
+            ]
+        )
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            candidate_text = str(candidate)
+            if candidate_text in seen:
+                continue
+            seen.add(candidate_text)
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def _youtube_access_args(self) -> list[str]:
+        args = ["--cookies-from-browser", "firefox"]
+        deno_path = self._resolve_deno_path()
+        if deno_path:
+            args.extend(["--js-runtimes", f"deno:{deno_path}"])
+        return args
 
     def _require_yt_dlp_invocation(self) -> dict[str, Any]:
         invocation = self._resolve_yt_dlp_invocation()
@@ -1286,6 +1360,23 @@ class Plugin:
         if not version:
             return None
         return version.splitlines()[0]
+
+    async def _get_deno_version(self, deno_path: Path) -> str | None:
+        result = await self._run_command([str(deno_path), "--version"], timeout=20)
+        if result.returncode != 0:
+            return None
+        first_line = (result.stdout or "").strip().splitlines()
+        if not first_line:
+            return None
+        match = re.search(r"\bdeno\s+(\d+(?:\.\d+){1,3})", first_line[0])
+        return match.group(1) if match else None
+
+    def _is_supported_deno_version(self, version: str | None) -> bool:
+        if not version:
+            return False
+        parts = [int(value) for value in re.findall(r"\d+", version)[:3]]
+        parts.extend([0] * (3 - len(parts)))
+        return tuple(parts) >= DENO_MINIMUM_VERSION
 
     async def _run_command(
         self, command: list[str], timeout: int = 120, env: dict[str, str] | None = None
@@ -1486,6 +1577,191 @@ class Plugin:
             return None
         return max(audio_files, key=lambda path: path.stat().st_mtime)
 
+    async def _ensure_deno(self) -> str | None:
+        existing_path = self._resolve_deno_path()
+        if existing_path:
+            existing_version = await self._get_deno_version(existing_path)
+            if self._is_supported_deno_version(existing_version):
+                self._log_info(
+                    f"Using Deno {existing_version} at {existing_path} for yt-dlp"
+                )
+                return None
+            self._log_warning(
+                f"Deno at {existing_path} is unsupported "
+                f"({existing_version or 'unknown version'}); installing a managed copy"
+            )
+
+        try:
+            await self._install_deno()
+        except Exception as error:
+            self._log_error(f"Failed to install Deno: {error}")
+            return self._trim_message(str(error), 220)
+
+        installed_version = await self._get_deno_version(self._deno_path)
+        if not self._is_supported_deno_version(installed_version):
+            return (
+                f"installed Deno version is unsupported: "
+                f"{installed_version or 'unknown'}"
+            )
+        self._log_info(
+            f"Deno {installed_version} installed successfully at {self._deno_path}"
+        )
+        return None
+
+    async def _install_deno(self) -> None:
+        platform_key = (platform.system().lower(), platform.machine().lower())
+        asset_name = DENO_RELEASE_ASSETS.get(platform_key)
+        if not asset_name:
+            raise RuntimeError(
+                "automatic Deno installation is not supported on "
+                f"{platform_key[0] or 'unknown OS'}/{platform_key[1] or 'unknown architecture'}"
+            )
+
+        self._settings_dir.mkdir(parents=True, exist_ok=True)
+        self._deno_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_url = f"{DENO_RELEASE_BASE_URL}/{asset_name}"
+        checksum_url = f"{asset_url}.sha256sum"
+
+        with tempfile.TemporaryDirectory(
+            prefix="deno-install-", dir=str(self._settings_dir)
+        ) as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            archive_path = temp_dir / asset_name
+            checksum_path = temp_dir / f"{asset_name}.sha256sum"
+            extracted_path = temp_dir / "deno"
+
+            await self._download_file(asset_url, archive_path, timeout=300)
+            await self._download_file(checksum_url, checksum_path, timeout=60)
+
+            checksum_match = re.search(
+                r"\b([0-9a-fA-F]{64})\b",
+                checksum_path.read_text(encoding="utf-8", errors="replace"),
+            )
+            if not checksum_match:
+                raise RuntimeError("Deno release checksum was missing or invalid")
+
+            digest = hashlib.sha256()
+            with archive_path.open("rb") as archive_handle:
+                for chunk in iter(lambda: archive_handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            expected_digest = checksum_match.group(1).lower()
+            if digest.hexdigest().lower() != expected_digest:
+                raise RuntimeError("Deno release checksum verification failed")
+
+            with zipfile.ZipFile(archive_path) as archive:
+                deno_member = next(
+                    (
+                        member
+                        for member in archive.infolist()
+                        if not member.is_dir() and Path(member.filename).name == "deno"
+                    ),
+                    None,
+                )
+                if deno_member is None:
+                    raise RuntimeError("Deno release archive did not contain the executable")
+                with archive.open(deno_member) as source, extracted_path.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+            extracted_path.chmod(0o755)
+            extracted_path.replace(self._deno_path)
+
+    async def _download_file(
+        self, url: str, target_path: Path, timeout: int = 220
+    ) -> None:
+        errors: list[str] = []
+
+        def clear_target() -> None:
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+            except OSError:
+                pass
+
+        curl_path = shutil.which("curl")
+        if curl_path:
+            clear_target()
+            try:
+                result = await self._run_command(
+                    [
+                        curl_path,
+                        "-fsSL",
+                        "--retry",
+                        "3",
+                        "--retry-delay",
+                        "1",
+                        "--connect-timeout",
+                        "20",
+                        "--max-time",
+                        str(timeout),
+                        "-A",
+                        "ThemeDeck/3 (+Decky Loader)",
+                        "-o",
+                        str(target_path),
+                        url,
+                    ],
+                    timeout=timeout + 20,
+                )
+                if (
+                    result.returncode == 0
+                    and target_path.exists()
+                    and target_path.stat().st_size > 0
+                ):
+                    return
+                errors.append(
+                    f"curl: {self._command_error(result, 'download failed')}"
+                )
+            except Exception as error:
+                errors.append(f"curl: {error}")
+
+        wget_path = shutil.which("wget")
+        if wget_path:
+            clear_target()
+            try:
+                result = await self._run_command(
+                    [
+                        wget_path,
+                        "--quiet",
+                        "--tries=3",
+                        "--timeout=20",
+                        "-O",
+                        str(target_path),
+                        url,
+                    ],
+                    timeout=timeout + 20,
+                )
+                if (
+                    result.returncode == 0
+                    and target_path.exists()
+                    and target_path.stat().st_size > 0
+                ):
+                    return
+                errors.append(
+                    f"wget: {self._command_error(result, 'download failed')}"
+                )
+            except Exception as error:
+                errors.append(f"wget: {error}")
+
+        clear_target()
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "ThemeDeck/3 (+Decky Loader)"}
+            )
+
+            def download_with_urllib() -> None:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    with target_path.open("wb") as target:
+                        shutil.copyfileobj(response, target)
+
+            await asyncio.to_thread(download_with_urllib)
+            if target_path.exists() and target_path.stat().st_size > 0:
+                return
+            errors.append("urllib: download returned no data")
+        except Exception as error:
+            errors.append(f"urllib: {error}")
+
+        clear_target()
+        raise RuntimeError(self._trim_message("; ".join(errors), 280))
+
     async def _download_yt_dlp_binary(self, target_path: Path) -> None:
         errors: list[str] = []
 
@@ -1626,7 +1902,7 @@ class Plugin:
             "install",
             "--upgrade",
             "--user",
-            "yt-dlp",
+            "yt-dlp[default]",
             "--trusted-host",
             "pypi.org",
             "--trusted-host",
@@ -1661,7 +1937,7 @@ class Plugin:
                 "install",
                 "--upgrade",
                 "pip",
-                "yt-dlp",
+                "yt-dlp[default]",
                 "--trusted-host",
                 "pypi.org",
                 "--trusted-host",

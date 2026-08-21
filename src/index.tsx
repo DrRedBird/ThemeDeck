@@ -164,6 +164,11 @@ type YtDlpStatus = {
   path?: string;
   source?: string;
   version?: string;
+  ready?: boolean;
+  deno_installed?: boolean;
+  deno_path?: string;
+  deno_version?: string;
+  cookies_browser?: string;
 };
 
 type BulkAssignStatus = {
@@ -4953,7 +4958,7 @@ const Content = () => {
     setYtDlpBusy(true);
     toaster.toast({
       title: "ThemeDeck",
-      body: "Updating yt-dlp. This can take a minute.",
+      body: "Updating YouTube support (yt-dlp and Deno). This can take a minute.",
     });
     try {
       const status = await updateYtDlp();
@@ -4962,10 +4967,14 @@ const Content = () => {
         version: status.version || "",
         source: status.source || "",
         path: status.path || "",
+        denoVersion: status.deno_version || "",
+        denoPath: status.deno_path || "",
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
+        body: `YouTube support ready (yt-dlp ${
+          formatYtDlpVersion(status.version) || "latest"
+        }, Deno ${status.deno_version || "ready"})`,
       });
     } catch (error) {
       console.error("[ThemeDeck] update yt-dlp failed", error);
@@ -4974,7 +4983,7 @@ const Content = () => {
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `Failed to update yt-dlp: ${getErrorMessage(
+        body: `Failed to update YouTube support: ${getErrorMessage(
           error,
           "Unknown update error"
         )}`,
@@ -5002,10 +5011,10 @@ const Content = () => {
       return;
     }
     setBulkAssignMode(mode);
-    if (!ytDlpStatus.installed) {
+    if (!ytDlpStatus.ready) {
       toaster.toast({
         title: "ThemeDeck",
-        body: "yt-dlp is not installed yet.",
+        body: "YouTube support is not ready. Use Update YouTube support first.",
       });
       return;
     }
@@ -5323,7 +5332,7 @@ const Content = () => {
     libraryGames,
     tracks,
     ytDlpBusy,
-    ytDlpStatus.installed,
+    ytDlpStatus.ready,
     setTracks,
   ]);
 
@@ -5953,12 +5962,18 @@ const Content = () => {
               }}
             >
               <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: "0.86rem" }}>
-                Only update yt-dlp if YouTube search doesn't work.
+                Use this if YouTube search, previews, or downloads stop working.
               </div>
               <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
                 {ytDlpStatus.installed
                   ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
                   : "yt-dlp not installed"}
+              </div>
+              <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
+                {ytDlpStatus.deno_installed
+                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
+                  : "Deno not configured"}
+                {" • Firefox cookies configured"}
               </div>
               <button
                 className="DialogButton themedeck-fit themedeck-wrap"
@@ -5973,7 +5988,7 @@ const Content = () => {
                   border: "1px solid rgba(255, 107, 107, 0.7)",
                 }}
               >
-                {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
+                {ytDlpBusy ? "Updating..." : "Update YouTube support"}
               </button>
             </div>
           </PanelSectionRow>
@@ -7110,11 +7125,17 @@ const ChangeTheme = () => {
                   {ytDlpStatus.path}
                 </div>
               ) : null}
+              <div style={{ fontSize: "0.82rem", opacity: 0.8 }}>
+                {ytDlpStatus.deno_installed
+                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
+                  : "Deno not configured"}
+                {" • previews and downloads use Firefox cookies"}
+              </div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
                 Search YouTube for game music, download audio locally, and assign it to
-                this game.
+                this game. Sign in to YouTube in Firefox before previewing or downloading.
               </div>
-              {!ytDlpStatus.installed ? (
+              {!ytDlpStatus.ready ? (
 	                  <ControllerButton
 	                    onCancel={navigateBack}
 	                  onClick={async () => {
@@ -7131,7 +7152,7 @@ const ChangeTheme = () => {
 	                    setYtDlpBusy(true);
 	                    toaster.toast({
 	                      title: "ThemeDeck",
-	                      body: "Installing/updating yt-dlp. This can take a minute.",
+	                      body: "Installing/updating yt-dlp and Deno. This can take a minute.",
 	                    });
 	                    try {
 	                      const status = await updateYtDlp();
@@ -7141,10 +7162,14 @@ const ChangeTheme = () => {
 	                        version: status.version || "",
 	                        source: status.source || "",
 	                        path: status.path || "",
+	                        denoVersion: status.deno_version || "",
+	                        denoPath: status.deno_path || "",
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-	                        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
+	                        body: `YouTube support ready (yt-dlp ${
+	                          formatYtDlpVersion(status.version) || "latest"
+	                        }, Deno ${status.deno_version || "ready"})`,
 	                      });
 	                    } catch (error) {
 	                      logClient("error", "yt_dlp_install_failed", {
@@ -7153,7 +7178,7 @@ const ChangeTheme = () => {
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-                        body: `Failed to install yt-dlp: ${getErrorMessage(
+                        body: `Failed to install YouTube support: ${getErrorMessage(
                           error,
                           "Unknown update error"
                         )}`,
@@ -7166,7 +7191,11 @@ const ChangeTheme = () => {
                   disabled={ytDlpBusy}
                   style={{ width: "fit-content" }}
                 >
-                  {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
+                  {ytDlpBusy
+                    ? "Installing..."
+                    : ytDlpStatus.installed
+                      ? "Set up YouTube support"
+                      : "Install YouTube support"}
                 </ControllerButton>
               ) : null}
             </div>
