@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.2-beta.2 - 2026-08-28
+## Unreleased
 - Installs `yt-dlp[default]` so the `yt-dlp-ejs` challenge scripts and recommended dependencies stay in sync with yt-dlp.
 - Detects a supported Deno runtime and installs a checksum-verified, ThemeDeck-managed copy when needed.
 - Configures YouTube previews and downloads to use Deno, with optional Firefox browser cookies, without overwriting the user's global yt-dlp configuration.
