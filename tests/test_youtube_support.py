@@ -27,6 +27,7 @@ class YouTubeSupportTests(unittest.IsolatedAsyncioTestCase):
         settings_dir = Path(self.temp_dir.name)
         self.plugin = main.Plugin()
         self.plugin._settings_dir = settings_dir
+        self.plugin._youtube_support_settings_file = settings_dir / "youtube-support.json"
         self.plugin._bin_dir = settings_dir / "bin"
         self.plugin._yt_dlp_path = self.plugin._bin_dir / "yt-dlp"
         self.plugin._yt_venv_dir = settings_dir / "ytvenv"
@@ -39,10 +40,17 @@ class YouTubeSupportTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_youtube_access_uses_firefox_and_explicit_deno_path(self) -> None:
+    def test_firefox_cookie_access_is_opt_in_and_uses_explicit_deno_path(self) -> None:
         self.plugin._deno_path.parent.mkdir(parents=True)
         self.plugin._deno_path.write_bytes(b"deno")
 
+        self.assertEqual(
+            self.plugin._youtube_access_args(),
+            ["--js-runtimes", f"deno:{self.plugin._deno_path}"],
+        )
+
+        self.plugin._use_firefox_cookies = True
+        self.plugin._save_youtube_support_settings()
         self.assertEqual(
             self.plugin._youtube_access_args(),
             [
@@ -52,6 +60,25 @@ class YouTubeSupportTests(unittest.IsolatedAsyncioTestCase):
                 f"deno:{self.plugin._deno_path}",
             ],
         )
+
+        self.plugin._use_firefox_cookies = False
+        self.plugin._load_youtube_support_settings()
+        self.assertTrue(self.plugin._use_firefox_cookies)
+
+    async def test_firefox_cookie_setting_is_saved(self) -> None:
+        expected_status = {"firefox_cookies_enabled": True}
+        with patch.object(
+            self.plugin,
+            "get_yt_dlp_status",
+            AsyncMock(return_value=expected_status),
+        ):
+            status = await self.plugin.set_youtube_firefox_cookies(True)
+
+        self.assertEqual(status, expected_status)
+        self.assertTrue(self.plugin._use_firefox_cookies)
+        self.plugin._use_firefox_cookies = False
+        self.plugin._load_youtube_support_settings()
+        self.assertTrue(self.plugin._use_firefox_cookies)
 
     def test_deno_minimum_version(self) -> None:
         self.assertFalse(self.plugin._is_supported_deno_version(None))
@@ -86,6 +113,57 @@ class YouTubeSupportTests(unittest.IsolatedAsyncioTestCase):
 
         pip_command = next(command for command in commands if "pip" in command)
         self.assertIn("yt-dlp[default]", pip_command)
+
+    async def test_failed_venv_update_prefers_verified_local_fallback(self) -> None:
+        self.plugin._yt_venv_bin.mkdir(parents=True, exist_ok=True)
+        self.plugin._yt_venv_yt_dlp.write_bytes(b"old yt-dlp")
+        self.plugin._yt_venv_yt_dlp.chmod(0o755)
+
+        async def fake_download(target: Path) -> None:
+            target.write_bytes(b"#!/usr/bin/env python3\n# replacement yt-dlp\n")
+
+        async def fake_finish() -> dict[str, object]:
+            invocation = self.plugin._resolve_yt_dlp_invocation()
+            self.assertIsNotNone(invocation)
+            return {
+                "installed": True,
+                "source": invocation["source"],
+                "path": invocation["path"],
+                "version": "2026.08.01",
+                "deno_version": "2.9.5",
+            }
+
+        with patch.object(
+            self.plugin,
+            "_install_yt_dlp_in_venv",
+            AsyncMock(return_value="venv pip install failed"),
+        ):
+            with patch.object(
+                self.plugin,
+                "_download_yt_dlp_binary",
+                side_effect=fake_download,
+            ):
+                with patch.object(
+                    self.plugin,
+                    "_get_yt_dlp_version",
+                    AsyncMock(return_value="2026.08.01"),
+                ):
+                    with patch.object(
+                        self.plugin,
+                        "_finish_youtube_support_setup",
+                        side_effect=fake_finish,
+                    ):
+                        status = await self.plugin.update_yt_dlp()
+
+        self.assertEqual(status["source"], "local")
+        self.assertEqual(self.plugin._preferred_yt_dlp_source, "local")
+        self.plugin._preferred_yt_dlp_source = "venv"
+        self.plugin._load_youtube_support_settings()
+        self.assertEqual(self.plugin._preferred_yt_dlp_source, "local")
+        self.assertEqual(
+            self.plugin._resolve_yt_dlp_invocation()["source"],
+            "local",
+        )
 
     async def test_managed_deno_install_verifies_and_extracts_release(self) -> None:
         archive_buffer = io.BytesIO()

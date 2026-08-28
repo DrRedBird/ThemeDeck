@@ -56,6 +56,9 @@ class Plugin:
         self._store_track_key = "__store__"
         self._settings_dir = Path(decky.DECKY_PLUGIN_SETTINGS_DIR)
         self._tracks_file = self._settings_dir / "tracks.json"
+        self._youtube_support_settings_file = (
+            self._settings_dir / "youtube-support.json"
+        )
         self._bin_dir = self._settings_dir / "bin"
         self._yt_dlp_path = self._bin_dir / "yt-dlp"
         self._yt_venv_dir = self._settings_dir / "ytvenv"
@@ -72,6 +75,8 @@ class Plugin:
         self._playback_started_at: float = 0.0
         self._playback_start_offset: float = 0.0
         self._playback_log_file = self._settings_dir / "backend-player.log"
+        self._use_firefox_cookies = False
+        self._preferred_yt_dlp_source = "venv"
 
     async def _main(self) -> None:
         self._settings_dir.mkdir(parents=True, exist_ok=True)
@@ -79,6 +84,7 @@ class Plugin:
         self._downloads_dir.mkdir(parents=True, exist_ok=True)
         self._preview_dir.mkdir(parents=True, exist_ok=True)
         self._load_tracks()
+        self._load_youtube_support_settings()
         self._log_info("ThemeDeck backend ready")
 
     async def _unload(self) -> None:
@@ -589,7 +595,8 @@ class Plugin:
             "deno_installed": deno_installed,
             "deno_path": str(deno_path) if deno_path else "",
             "deno_version": deno_version or "",
-            "cookies_browser": "firefox",
+            "cookies_browser": "firefox" if self._use_firefox_cookies else "",
+            "firefox_cookies_enabled": self._use_firefox_cookies,
             "ready": installed and deno_installed,
         }
         if not invocation:
@@ -608,6 +615,15 @@ class Plugin:
             f"deno={deno_version or 'not installed'} ready={status.get('ready')}"
         )
         return status
+
+    async def set_youtube_firefox_cookies(self, enabled: bool) -> dict[str, Any]:
+        self._use_firefox_cookies = enabled is True
+        self._save_youtube_support_settings()
+        self._log_info(
+            "YouTube Firefox cookie access "
+            f"{'enabled' if self._use_firefox_cookies else 'disabled'}"
+        )
+        return await self.get_yt_dlp_status()
 
     async def _finish_youtube_support_setup(self) -> dict[str, Any]:
         deno_error = await self._ensure_deno()
@@ -630,6 +646,7 @@ class Plugin:
         if venv_error:
             self._log_warning(f"yt-dlp venv install/update failed: {venv_error}")
         else:
+            self._set_preferred_yt_dlp_source("venv")
             self._log_info("yt-dlp venv install/update completed")
         status = await self.get_yt_dlp_status()
         if not venv_error and status.get("source") == "venv":
@@ -661,14 +678,17 @@ class Plugin:
                 raise RuntimeError(
                     f"Installed file is not executable: {self._yt_dlp_path}"
                 )
+            self._set_preferred_yt_dlp_source("local")
             self._log_info(f"yt-dlp local binary updated successfully ({version})")
         except Exception as error:
             self._log_error(f"Failed to update yt-dlp local binary: {error}")
             pip_error = await self._try_install_yt_dlp_with_pip()
             if pip_error:
                 self._log_warning(f"yt-dlp user pip fallback failed: {pip_error}")
+            else:
+                self._set_preferred_yt_dlp_source("system")
             status = await self.get_yt_dlp_status()
-            if status.get("installed"):
+            if not pip_error and status.get("source") == "system":
                 self._log_info("yt-dlp became available via pip/system fallback")
                 return await self._finish_youtube_support_setup()
             summary = self._trim_message(str(error), 140)
@@ -882,6 +902,26 @@ class Plugin:
         except Exception as error:
             decky.logger.error(f"Failed to read tracks.json: {error}")
 
+    def _load_youtube_support_settings(self) -> None:
+        self._use_firefox_cookies = False
+        self._preferred_yt_dlp_source = "venv"
+        if not self._youtube_support_settings_file.exists():
+            return
+
+        try:
+            with self._youtube_support_settings_file.open(
+                "r", encoding="utf-8"
+            ) as handle:
+                settings = json.load(handle)
+            if not isinstance(settings, dict):
+                raise ValueError("settings root must be an object")
+            self._use_firefox_cookies = settings.get("use_firefox_cookies") is True
+            preferred_source = settings.get("preferred_yt_dlp_source")
+            if preferred_source in {"venv", "local", "system"}:
+                self._preferred_yt_dlp_source = preferred_source
+        except Exception as error:
+            decky.logger.error(f"Failed to read youtube-support.json: {error}")
+
     def _resolve_audio_player(self) -> str | None:
         if self._find_command_path("ffplay"):
             return "ffplay"
@@ -972,6 +1012,26 @@ class Plugin:
                 json.dump(self._tracks, handle, indent=2, ensure_ascii=False)
         except Exception as error:
             decky.logger.error(f"Failed to save tracks.json: {error}")
+
+    def _save_youtube_support_settings(self) -> None:
+        try:
+            self._settings_dir.mkdir(parents=True, exist_ok=True)
+            settings = {
+                "use_firefox_cookies": self._use_firefox_cookies,
+                "preferred_yt_dlp_source": self._preferred_yt_dlp_source,
+            }
+            with self._youtube_support_settings_file.open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(settings, handle, indent=2)
+        except Exception as error:
+            decky.logger.error(f"Failed to save youtube-support.json: {error}")
+
+    def _set_preferred_yt_dlp_source(self, source: str) -> None:
+        if source not in {"venv", "local", "system"}:
+            raise ValueError(f"Unsupported yt-dlp source: {source}")
+        self._preferred_yt_dlp_source = source
+        self._save_youtube_support_settings()
 
     def _write_debug_log(self, level: str, message: str) -> None:
         try:
@@ -1278,39 +1338,53 @@ class Plugin:
         return cleaned
 
     def _resolve_yt_dlp_invocation(self) -> dict[str, Any] | None:
+        invocations: dict[str, list[dict[str, Any]]] = {
+            "venv": [],
+            "local": [],
+            "system": [],
+        }
+
         if self._yt_venv_yt_dlp.exists() and os.access(self._yt_venv_yt_dlp, os.X_OK):
-            return {
+            invocations["venv"].append({
                 "command": [str(self._yt_venv_yt_dlp)],
                 "env": None,
                 "source": "venv",
                 "path": str(self._yt_venv_yt_dlp),
-            }
+            })
 
         if self._yt_dlp_path.exists() and os.access(self._yt_dlp_path, os.X_OK):
-            return {
+            invocations["local"].append({
                 "command": [str(self._yt_dlp_path)],
                 "env": None,
                 "source": "local",
                 "path": str(self._yt_dlp_path),
-            }
+            })
 
         user_yt_dlp = Path.home() / ".local" / "bin" / "yt-dlp"
         if user_yt_dlp.exists() and os.access(user_yt_dlp, os.X_OK):
-            return {
+            invocations["system"].append({
                 "command": [str(user_yt_dlp)],
                 "env": None,
                 "source": "system",
                 "path": str(user_yt_dlp),
-            }
+            })
 
         system_yt_dlp = shutil.which("yt-dlp")
         if system_yt_dlp:
-            return {
+            invocations["system"].append({
                 "command": [system_yt_dlp],
                 "env": None,
                 "source": "system",
                 "path": system_yt_dlp,
-            }
+            })
+
+        source_order = ["venv", "local", "system"]
+        if self._preferred_yt_dlp_source in source_order:
+            source_order.remove(self._preferred_yt_dlp_source)
+            source_order.insert(0, self._preferred_yt_dlp_source)
+        for source in source_order:
+            if invocations[source]:
+                return invocations[source][0]
 
         return None
 
@@ -1337,7 +1411,9 @@ class Plugin:
         return None
 
     def _youtube_access_args(self) -> list[str]:
-        args = ["--cookies-from-browser", "firefox"]
+        args: list[str] = []
+        if self._use_firefox_cookies:
+            args.extend(["--cookies-from-browser", "firefox"])
         deno_path = self._resolve_deno_path()
         if deno_path:
             args.extend(["--js-runtimes", f"deno:{deno_path}"])
